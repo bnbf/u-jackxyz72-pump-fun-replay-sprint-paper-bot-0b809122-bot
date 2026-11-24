@@ -10,13 +10,14 @@ activity. Nothing is traded for real.
 
 ## Strategy
 
-Early-momentum sniper: on pump.fun a coin's fate is mostly decided in its first few
-slots, so the bot buys only launches whose opening tape already proves demand — at
-least 5 trades, 4 distinct non-creator buyers, 3 SOL of net inflow, and the creator
-buying in, all inside the first 8 slots, with the price up a little but not already
-pumped. It takes a 0.15 SOL stake per coin in small adds, then exits fast: a -8% stop,
-a 30% trailing stop once the position is +10%, a hard 800-slot time limit, and
-immediate exits when the creator sells, the tape goes stale, or the flow fades.
+Survivor sniper: buying every launch loses on this data, so the bot waits for proof.
+It enters only when a coin's real SOL reserve crosses 10 SOL while net buy flow over
+the last 30 slots stays strong and the price is already up 50%+ from create — a
+survivor that keeps running — then pyramids into the run up to a 0.4 SOL stake, and
+exits fast: a -10% stop, a 25% trailing stop once the position is +10% up, a 600-slot
+time limit, and immediate exits when the creator sells, the tape goes stale, or flow
+fades. Tiny probe round trips cover the 20-coin guardrail when the run's own coins lag
+the pace.
 
 ## Layout
 
