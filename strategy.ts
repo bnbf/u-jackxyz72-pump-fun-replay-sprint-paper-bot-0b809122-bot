@@ -2,24 +2,33 @@
 //
 // Why this shape: buying every launch loses on this data (the house sniper pilot
 // ends -0.47 SOL, this bot's own early-momentum v1 -0.30 SOL). What does win is
-// waiting for proof. A coin whose real SOL reserve crosses 10 SOL is a survivor:
-// on the dev window 53-60% of such coins run at least another +25% within 500 slots
-// (median further max +28-39%), while coins that never get there almost all die.
-// So the bot enters only on the one batch where the reserve crosses 10 SOL from
-// below, while net buy flow over the last 30 slots stays strong and the price is
-// already up 50%+ from create — then pyramids into the run (adds up to 0.4 SOL
-// while flow stays strong) and exits fast: a -10% stop, a 25% trailing stop once
-// +10% up, a 600-slot time limit, and immediate exits when the creator sells, the
-// tape goes stale, or flow fades. The trigger must be one-shot: retrying the entry
-// for 100 slots after the crossing buys dead-cat bounces and lost -6.8 SOL on dev.
-// The 20-coin guardrail is covered by tiny probe round trips when the run's own coins
-// lag the pace. A pure function of the batches: no clock, no randomness, no I/O.
+// waiting for proof AND demanding the strongest proof. A coin whose real SOL
+// reserve crosses 10 SOL is a survivor, but most survivors still dump: from the
+// fill price the median coin is flat for ~10 slots, then -5.5% by +25 slots and
+// -44% by +600 slots. The edge is only in the coins already up 2.25x+ from
+// create at the crossing (minUp 1.25): those keep running often enough that a
+// fast scalp — take +10%, stop -7%, out within 50 slots, exit on a 5-slot flow
+// fade — is net positive across the whole flat region (minUp 1.0-2.0, TP 5-20%,
+// hold 25-100 all positive offline). Weaker survivors (1.5-2x) are negative, so
+// the entry filter is the whole game; adds were tested and hurt (they buy into
+// the dump at higher prices), so positions are one-shot single buys.
+// The trigger is one-shot: retrying the entry for 100 slots after the crossing
+// buys dead-cat bounces and lost -6.8 SOL on dev (v3 grade). The 20-coin
+// guardrail is covered by tiny probe round trips when the run's own coins lag
+// the pace (the strong filter trades ~74 coins on dev, so the probe is insurance).
+// A pure function of the batches: no clock, no randomness, no I/O.
 //
 // Fees: a round trip pays ~1.25% curve fee each way plus one 105k-lamport tx fee per
-// order, so a trade needs roughly +3% to break even; the stop and the trail are set
-// with that in mind. Sizing is capped by the harness: at most 1% of a curve's real
-// SOL reserve per reply, so a 0.4 SOL stake is built over several replies as the
-// reserve grows.
+// order, so a trade needs roughly +3% to break even; the take-profit and the stop
+// are set with that in mind. Sizing is capped by the harness: at most 1% of a
+// curve's real SOL reserve per reply, so a first buy at the crossing is ~0.1-0.15 SOL.
+//
+// NOTE on the earlier +3.05 SOL simulator claim (v3/v4 notes): the offline sim had
+// a lookahead bug — its windowed-flow loop walked a coin's trades from the END of
+// the day backwards, so the entry filter read the coin's FUTURE flow. The honest
+// replay (pumpfun_offline.py, correct windows, exit fills at trigger+2 slots)
+// puts v4 at -6.1 SOL, matching its real -6.9 grade. Do not trust any sim number
+// that was produced before that fix.
 
 import type { Batch, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
@@ -42,8 +51,9 @@ export interface Params {
   addMaxRunup: number;
   /** Net SOL inflow over the flow window an add still needs. */
   addMinNet: number;
-  /** Exits: stop loss, trailing-stop arm / trail, max hold (slots). */
+  /** Exits: stop loss, take profit, trailing-stop arm / trail, max hold (slots). */
   stopLoss: number;
+  takeProfit: number;
   trailArm: number;
   trail: number;
   maxHold: number;
@@ -63,30 +73,32 @@ export interface Params {
   maxProbes: number;
 }
 
-// Settings from the faithful slot-level simulator (see NEXT_STEPS_PUMPFUN_REPLAY.md):
-// the survivor grid is positive across its whole flat region (thr 10-20, stake
-// 0.1-0.4, trail 15-25%); these are its middle, not its single best cell.
+// Settings from the honest offline replay (pumpfun_offline.py, correct windows,
+// exit fills at trigger+2 slots): the strong-survivor scalp is positive across a
+// broad flat region — minUp 1.0-2.0, TP 0.05-0.20, hold 25-100 all positive —
+// these are its middle, not its single best cell.
 export const DEFAULT_PARAMS: Params = {
   survRqMin: 10,
   survRqMax: 85,
   survMinNet: 3,
   survFlowWindow: 30,
-  survMinUp: 0.5,
+  survMinUp: 1.25,
   stakeSol: 0.4,
   firstSol: 0.4,
-  maxAdds: 4,
+  maxAdds: 0,
   addSol: 0.1,
   addMaxAge: 100,
   addMaxRunup: 0.5,
   addMinNet: 1,
-  stopLoss: 0.1,
+  stopLoss: 0.07,
+  takeProfit: 0.1,
   trailArm: 0.1,
   trail: 0.25,
-  maxHold: 600,
+  maxHold: 50,
   exitOnDevSell: true,
   staleSlots: 600,
-  fadeWindow: 30,
-  fadeNetSol: -2,
+  fadeWindow: 5,
+  fadeNetSol: -0.5,
   buySlipBps: 10_000,
   sellSlipBps: 10_000,
   targetCoins: 30,
@@ -268,6 +280,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
         const t = tapeOf(mint);
         let exit = h.exiting;
         if (!exit && cost > 0 && value < cost * (1 - p.stopLoss)) exit = true;
+        if (!exit && cost > 0 && value >= cost * (1 + p.takeProfit)) exit = true;
         if (!exit && h.peakValue >= cost * (1 + p.trailArm) && value < h.peakValue * (1 - p.trail)) exit = true;
         if (!exit && now - h.opened > p.maxHold) exit = true;
         if (!exit && p.exitOnDevSell && t.devSold) exit = true;
@@ -298,8 +311,10 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
       // coin is entered only on the batch where its real SOL reserve crosses survRqMin
       // from below. A band that retries for 100 slots after the crossing enters far
       // more coins — mostly dead-cat bounces of coins already dumping — and lost
-      // -6.8 SOL on the dev window (v3 grade); the one-shot crossing is what the
-      // simulator validated at +3.0 SOL.
+      // -6.8 SOL on the dev window (v3 grade). The one-shot crossing with the strong
+      // filter (price already 2.25x+ from create) is what the honest offline replay
+      // validates at about +0.5 SOL; the earlier +3.0 SOL simulator claim was a
+      // lookahead artifact (see the header note) and is retracted.
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
 
