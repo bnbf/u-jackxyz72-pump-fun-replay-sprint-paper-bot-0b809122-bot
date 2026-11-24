@@ -1,35 +1,40 @@
-// Survivor sniper for the pump.fun replay (agent-fun/replay/v2).
-// The grader runs `node /bot/main.ts`; the strategy lives in strategy.ts and the SDK
-// shim is the kit's sdk/ts/makefun-bot.ts, vendored byte for byte in vendor/.
+// main.ts — entrypoint for the Pump.fun replay sprint bot.
 //
-// Strategy in one paragraph: buying every launch loses on this data, so the bot waits
-// for proof AND demands the strongest proof. It enters only when a coin's real SOL
-// reserve crosses 10 SOL while net buy flow over the last 30 slots stays strong and
-// the price is already up 125%+ from create — a strong survivor that keeps running —
-// then scalps it: take +10%, stop -7%, out within 50 slots, exit on a 5-slot flow
-// fade, and immediate exits when the creator sells or the tape goes stale. No adds:
-// pyramiding into the run was tested and loses. Tiny probe round trips cover the
-// 20-coin guardrail when the run's own coins lag the pace. Deterministic by
-// construction: no clock, no randomness, no I/O — only the batches the harness sends.
-//
-// v6: strategy.ts drops the per-batch tape-prune scan that dominated wall time and
-// timed the server grade out (see the SPEED note in strategy.ts); the strategy and
-// its parameters are unchanged.
+// Wiring only: the strategy lives in strategy.ts. runBot owns the wire
+// (stdin/stdout JSON lines, one reply per batch); this file hands it a
+// fresh SurvivorScalp and logs a one-line summary to stderr at the end.
+// No clock, no randomness, no environment reads: the run is fully
+// deterministic, so the grader's two executions produce byte-identical
+// action logs.
 
-import { runBot } from './vendor/makefun-bot.ts';
-import { createStrategy, DEFAULT_PARAMS } from './strategy.ts';
+import { runBot } from "./vendor/makefun-bot.ts";
+import type { Batch, BotState, Done } from "./vendor/makefun-bot.ts";
+import { SurvivorScalp } from "./strategy.ts";
 
-await runBot({
-  ...createStrategy(DEFAULT_PARAMS),
-  onDone(state, done) {
-    // Diagnostics only; stdout carries replies, never logs.
-    // Starting capital is 10 SOL and positions are flattened by done, so the
-    // cash line minus 10 SOL is the run's net PnL.
-    const pnlSol = (Number(done.account.cash_lamports) - 10 * 1e9) / 1e9;
-    console.error(
-      `done: ${done.reason} cash=${done.account.cash_lamports} ` +
-        `pnl=${pnlSol.toFixed(6)} SOL ` +
-        `positions=${done.account.positions.length} batches=${state.seq + 1}`,
-    );
-  },
-});
+const scalp = new SurvivorScalp();
+
+/** Build the bot object runBot drives: one batch in, orders out. */
+function buildBot(): {
+  onHello(state: BotState): void;
+  onBatch(state: BotState, batch: Batch): ReturnType<SurvivorScalp["onBatch"]>;
+  onDone(state: BotState, done: Done): void;
+} {
+  return {
+    onHello(state: BotState): void {
+      console.error(`hello: seed=${state.hello.seed} cash=${state.cash}`);
+    },
+    onBatch(state: BotState, batch: Batch) {
+      return scalp.onBatch(state, batch);
+    },
+    onDone(state: BotState, _done: Done): void {
+      const { batches, entries } = scalp.summary();
+      console.error(
+        `done: batches=${batches} entries=${entries} cash=${state.cash} positions=${state.positions.size}`,
+      );
+    },
+  };
+}
+
+// Speak agent-fun/replay/v2 on stdin/stdout until the harness sends done,
+// then stop reading and resolve; the process exits once stdout drains.
+await runBot(buildBot());
