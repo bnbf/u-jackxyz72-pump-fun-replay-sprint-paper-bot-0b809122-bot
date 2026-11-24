@@ -5,12 +5,14 @@
 // waiting for proof. A coin whose real SOL reserve crosses 10 SOL is a survivor:
 // on the dev window 53-60% of such coins run at least another +25% within 500 slots
 // (median further max +28-39%), while coins that never get there almost all die.
-// So the bot enters only at that breakout — real SOL crossing 10 while net buy flow
-// over the last 30 slots stays strong and the price is already up 50%+ from create —
-// then pyramids into the run (adds up to 0.4 SOL while flow stays strong) and exits
-// fast: a -10% stop, a 25% trailing stop once +10% up, a 600-slot time limit, and
-// immediate exits when the creator sells, the tape goes stale, or flow fades. The
-// 20-coin guardrail is covered by tiny probe round trips when the run's own coins
+// So the bot enters only on the one batch where the reserve crosses 10 SOL from
+// below, while net buy flow over the last 30 slots stays strong and the price is
+// already up 50%+ from create — then pyramids into the run (adds up to 0.4 SOL
+// while flow stays strong) and exits fast: a -10% stop, a 25% trailing stop once
+// +10% up, a 600-slot time limit, and immediate exits when the creator sells, the
+// tape goes stale, or flow fades. The trigger must be one-shot: retrying the entry
+// for 100 slots after the crossing buys dead-cat bounces and lost -6.8 SOL on dev.
+// The 20-coin guardrail is covered by tiny probe round trips when the run's own coins
 // lag the pace. A pure function of the batches: no clock, no randomness, no I/O.
 //
 // Fees: a round trip pays ~1.25% curve fee each way plus one 105k-lamport tx fee per
@@ -25,8 +27,6 @@ export interface Params {
   /** Survivor trigger: real SOL reserve crossing this (SOL), and the band it must stay in. */
   survRqMin: number;
   survRqMax: number;
-  /** Enter only within this many slots after the crossing. */
-  survCrossAge: number;
   /** Net SOL inflow over the flow window that must still be coming in. */
   survMinNet: number;
   survFlowWindow: number;
@@ -69,7 +69,6 @@ export interface Params {
 export const DEFAULT_PARAMS: Params = {
   survRqMin: 10,
   survRqMax: 85,
-  survCrossAge: 100,
   survMinNet: 3,
   survFlowWindow: 30,
   survMinUp: 0.5,
@@ -118,8 +117,8 @@ interface Tape {
   /** Decided for good: bought, exited, or completed. */
   done: boolean;
   complete: boolean;
-  /** Slot the real SOL reserve first reached survRqMin (null when below it). */
-  crossSlot: number | null;
+  /** Real SOL reserve at the end of the last batch this coin traded in (for crossing detection). */
+  prevRqSol: number;
 }
 
 interface Held {
@@ -167,7 +166,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
         lastTradeSlot: -1,
         done: false,
         complete: false,
-        crossSlot: null,
+        prevRqSol: 0,
       };
       tapes.set(mint, t);
     }
@@ -295,29 +294,31 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
         if (!selling) probes.set(mint, true);
       }
 
-      // Survivor entries and adds, strongest flow first.
+      // Survivor entries and adds, strongest flow first. The trigger is ONE-SHOT: a
+      // coin is entered only on the batch where its real SOL reserve crosses survRqMin
+      // from below. A band that retries for 100 slots after the crossing enters far
+      // more coins — mostly dead-cat bounces of coins already dumping — and lost
+      // -6.8 SOL on the dev window (v3 grade); the one-shot crossing is what the
+      // simulator validated at +3.0 SOL.
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
 
-      // Track the reserve crossing from the curves' latest reserves.
+      // One-shot crossing detection from the curves' latest reserves.
+      const crossing = new Set<Pubkey>();
       for (const mint of traded) {
         const curve = state.curves.get(mint);
         if (curve === undefined) continue;
         const t = tapes.get(mint)!;
         const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-        if (rqSol >= p.survRqMin) {
-          if (t.crossSlot === null) t.crossSlot = now;
-        } else {
-          t.crossSlot = null;
-        }
+        if (t.prevRqSol < p.survRqMin && rqSol >= p.survRqMin) crossing.add(mint);
+        t.prevRqSol = rqSol;
       }
 
       const candidates: { mint: Pubkey; net: number }[] = [];
-      for (const mint of traded) {
+      for (const mint of crossing) {
         const t = tapes.get(mint);
         if (t === undefined || t.done || t.complete) continue;
         if (held.has(mint) || probes.has(mint) || pendingByMint.has(mint)) continue;
-        if (t.crossSlot === null || now - t.crossSlot > p.survCrossAge) continue;
         candidates.push({ mint, net: flow(t, now, p.survFlowWindow) });
       }
       candidates.sort((a, b) => b.net - a.net || (a.mint < b.mint ? -1 : 1));
