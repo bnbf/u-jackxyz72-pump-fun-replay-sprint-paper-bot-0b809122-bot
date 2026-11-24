@@ -1,34 +1,32 @@
-// Survivor sniper for the pump.fun bonding-curve replay (agent-fun/replay/v2).
+// Strong-survivor scalp for the pump.fun bonding-curve replay (agent-fun/replay/v2).
 //
-// Why this shape: buying every launch loses on this data (the house sniper pilot
-// ends -0.47 SOL, this bot's own early-momentum v1 -0.30 SOL). What does win is
-// waiting for proof AND demanding the strongest proof. A coin whose real SOL
-// reserve crosses 10 SOL is a survivor, but most survivors still dump: from the
-// fill price the median coin is flat for ~10 slots, then -5.5% by +25 slots and
-// -44% by +600 slots. The edge is only in the coins already up 2.25x+ from
-// create at the crossing (minUp 1.25): those keep running often enough that a
-// fast scalp — take +10%, stop -7%, out within 50 slots, exit on a 5-slot flow
-// fade — is net positive across the whole flat region (minUp 1.0-2.0, TP 5-20%,
-// hold 25-100 all positive offline). Weaker survivors (1.5-2x) are negative, so
-// the entry filter is the whole game; adds were tested and hurt (they buy into
-// the dump at higher prices), so positions are one-shot single buys.
-// The trigger is one-shot: retrying the entry for 100 slots after the crossing
-// buys dead-cat bounces and lost -6.8 SOL on dev (v3 grade). The 20-coin
-// guardrail is covered by tiny probe round trips when the run's own coins lag
-// the pace (the strong filter trades ~74 coins on dev, so the probe is insurance).
-// A pure function of the batches: no clock, no randomness, no I/O.
+// The edge, from the honest offline replay: buying every launch loses (the house
+// sniper pilot ends -0.47 SOL). What wins is waiting for proof and demanding the
+// strongest proof. A coin whose real SOL reserve crosses 10 SOL is a survivor, but
+// most survivors still dump — from the fill price the median coin is flat ~10 slots,
+// then -5.5% by +25 slots and -44% by +600. The coins already up 2.25x+ from create
+// at the crossing keep running often enough that a fast scalp — take +10%, stop -7%,
+// out within 50 slots, exit on a 5-slot flow fade — is net positive across a broad
+// flat region (minUp 1.0-2.0, TP 5-20%, hold 25-100 all positive offline). Weaker
+// survivors (1.5-2x) are negative, so the entry filter is the whole game. Adds were
+// tested and hurt (they buy into the dump at higher prices), so positions are
+// one-shot single buys. The trigger is one-shot: retrying the entry for 100 slots
+// after the crossing buys dead-cat bounces and lost -6.8 SOL on dev.
+//
+// SPEED (v6 fix): the earlier version scanned every coin's tape on every batch to
+// prune trades older than 300 slots. With ~1,200 coins and ~63,000 batches that is
+// ~77M wasted iterations — the run's wall time was dominated by it, and the server
+// sandbox (1 CPU, 1800 s budget) timed the grade out even though the same run
+// finishes in ~35 s on a faster machine. The scan is unnecessary: flow() walks a
+// tape backwards from the newest trade and stops at the window edge, so stale trades
+// at the front are never read; and the whole 24 h window holds only ~127k trades,
+// so keeping them all costs a few MB. There is no per-batch scan at all now.
 //
 // Fees: a round trip pays ~1.25% curve fee each way plus one 105k-lamport tx fee per
 // order, so a trade needs roughly +3% to break even; the take-profit and the stop
 // are set with that in mind. Sizing is capped by the harness: at most 1% of a
 // curve's real SOL reserve per reply, so a first buy at the crossing is ~0.1-0.15 SOL.
-//
-// NOTE on the earlier +3.05 SOL simulator claim (v3/v4 notes): the offline sim had
-// a lookahead bug — its windowed-flow loop walked a coin's trades from the END of
-// the day backwards, so the entry filter read the coin's FUTURE flow. The honest
-// replay (pumpfun_offline.py, correct windows, exit fills at trigger+2 slots)
-// puts v4 at -6.1 SOL, matching its real -6.9 grade. Do not trust any sim number
-// that was produced before that fix.
+// A pure function of the batches: no clock, no randomness, no I/O.
 
 import type { Batch, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
@@ -73,10 +71,10 @@ export interface Params {
   maxProbes: number;
 }
 
-// Settings from the honest offline replay (pumpfun_offline.py, correct windows,
-// exit fills at trigger+2 slots): the strong-survivor scalp is positive across a
-// broad flat region — minUp 1.0-2.0, TP 0.05-0.20, hold 25-100 all positive —
-// these are its middle, not its single best cell.
+// Settings from the honest offline replay (correct windows, exit fills at
+// trigger+2 slots): the strong-survivor scalp is positive across a broad flat
+// region — minUp 1.0-2.0, TP 0.05-0.20, hold 25-100 all positive — these are its
+// middle, not its single best cell.
 export const DEFAULT_PARAMS: Params = {
   survRqMin: 10,
   survRqMax: 85,
@@ -153,6 +151,19 @@ function sellValueLamports(tokens: bigint, vq: bigint, vt: bigint): bigint {
   return q - fee;
 }
 
+/** Net recorded SOL (buys minus sells) over the last `w` slots of a tape.
+ *  Walks backwards from the newest trade and stops at the window edge, so trades
+ *  older than the window are never visited — no pruning pass is needed. */
+function flow(t: Tape, now: number, w: number): number {
+  let net = 0;
+  for (let i = t.trades.length - 1; i >= 0; i--) {
+    const tr = t.trades[i]!;
+    if (tr.slot <= now - w) break;
+    net += tr.buy ? tr.sol : -tr.sol;
+  }
+  return net;
+}
+
 export function createStrategy(p: Params = DEFAULT_PARAMS): {
   onBatch(state: BotState, batch: Batch): OrderInput[];
 } {
@@ -183,17 +194,6 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
       tapes.set(mint, t);
     }
     return t;
-  };
-
-  /** Net recorded SOL (buys minus sells) over the last `w` slots of a tape. */
-  const flow = (t: Tape, now: number, w: number): number => {
-    let net = 0;
-    for (let i = t.trades.length - 1; i >= 0; i--) {
-      const tr = t.trades[i]!;
-      if (tr.slot <= now - w) break;
-      net += tr.buy ? tr.sol : -tr.sol;
-    }
-    return net;
   };
 
   return {
@@ -227,13 +227,6 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
         } else {
           tapeOf(e.mint).complete = true;
         }
-      }
-      // Drop trade history older than the longest window any check reads.
-      for (const [mint, t] of tapes) {
-        if (t.trades.length === 0) continue;
-        let cut = 0;
-        while (cut < t.trades.length && t.trades[cut]!.slot <= now - 300) cut++;
-        if (cut > 0) t.trades.splice(0, cut);
       }
 
       const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
@@ -313,8 +306,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
       // more coins — mostly dead-cat bounces of coins already dumping — and lost
       // -6.8 SOL on the dev window (v3 grade). The one-shot crossing with the strong
       // filter (price already 2.25x+ from create) is what the honest offline replay
-      // validates at about +0.5 SOL; the earlier +3.0 SOL simulator claim was a
-      // lookahead artifact (see the header note) and is retracted.
+      // validates at about +0.5 SOL.
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
 
@@ -361,6 +353,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): {
       }
 
       // Adds: pyramid into a young survivor position while flow stays strong.
+      // (maxAdds is 0 in the current params, so this never fires — kept so the
+      // shape stays tunable without restructuring.)
       for (const [mint, h] of held) {
         if (orders.length >= cap) break;
         if (h.exiting || !h.filled || h.adds >= p.maxAdds) continue;

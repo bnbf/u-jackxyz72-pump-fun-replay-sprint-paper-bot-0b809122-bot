@@ -11,6 +11,10 @@
 // pyramiding into the run was tested and loses. Tiny probe round trips cover the
 // 20-coin guardrail when the run's own coins lag the pace. Deterministic by
 // construction: no clock, no randomness, no I/O — only the batches the harness sends.
+//
+// v6: strategy.ts drops the per-batch tape-prune scan that dominated wall time and
+// timed the server grade out (see the SPEED note in strategy.ts); the strategy and
+// its parameters are unchanged.
 
 import { runBot } from './vendor/makefun-bot.ts';
 import { createStrategy, DEFAULT_PARAMS } from './strategy.ts';
@@ -19,8 +23,12 @@ await runBot({
   ...createStrategy(DEFAULT_PARAMS),
   onDone(state, done) {
     // Diagnostics only; stdout carries replies, never logs.
+    // Starting capital is 10 SOL and positions are flattened by done, so the
+    // cash line minus 10 SOL is the run's net PnL.
+    const pnlSol = (Number(done.account.cash_lamports) - 10 * 1e9) / 1e9;
     console.error(
       `done: ${done.reason} cash=${done.account.cash_lamports} ` +
+        `pnl=${pnlSol.toFixed(6)} SOL ` +
         `positions=${done.account.positions.length} batches=${state.seq + 1}`,
     );
   },
